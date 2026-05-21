@@ -52,6 +52,7 @@ jobs:
             sh -c 'pip install /pkg/dist/*.whl && python -c "import kave; print(kave.__version__)"'
 
       - name: Sign packages
+        continue-on-error: true
         working-directory: sdk/py
         run: python -m sigstore sign --yes dist/*
 
