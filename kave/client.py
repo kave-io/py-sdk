@@ -1,74 +1,231 @@
 from __future__ import annotations
 
+import inspect
+import logging
+import uuid
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable
+
 import grpc
 import grpc.aio
 
-from kave.control.v1 import control_pb2_grpc  # type: ignore[import]
-from kave.runtime.v1 import runtime_pb2_grpc  # type: ignore[import]
+from kave import highlevel, iterators
+from kave._logging import rpc_timer
+from kave._tracing import inject_traceparent
 from kave.audit.v1 import audit_pb2_grpc  # type: ignore[import]
+from kave.control.v1 import control_pb2_grpc, rbac_pb2_grpc  # type: ignore[import]
+from kave.errors import wrap_error
+from kave.retry import DEFAULT_RETRY_POLICY, RetryPolicy, retry_async, retry_sync, should_retry_rpc
+from kave.runtime.v1 import runtime_pb2_grpc  # type: ignore[import]
+
+Metadata = Iterable[tuple[str, str]] | None
 
 
-class KaveClient:
-    """Async Kave control-plane client.
+@dataclass
+class ClientOptions:
+    addr: str = "localhost:19090"
+    token: str | None = None
+    tls: bool = False
+    credentials: grpc.ChannelCredentials | None = None
+    timeout: float = 30.0
+    retry: RetryPolicy | None = DEFAULT_RETRY_POLICY
+    logger: logging.Logger | None = None
+    tracer: Any | None = None
 
-    Usage::
 
-        from kave.control.v1 import control_pb2
+class _SyncServiceProxy:
+    def __init__(self, target: Any, options: ClientOptions) -> None:
+        self._target = target
+        self._options = options
 
-        async with KaveClient("localhost:8080", token="kv-...") as kave:
-            org = await kave.control.CreateOrganization(
-                control_pb2.CreateOrganizationRequest(name="acme", slug="acme")
-            )
-    """
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._target, name)
+        if not callable(attr):
+            return attr
 
+        def call(request: Any, *, timeout: float | None = None, metadata: Metadata = None, **kwargs: Any) -> Any:
+            rpc = getattr(attr, "_method", name)
+            rpc_name = rpc.decode() if isinstance(rpc, bytes) else str(rpc)
+            request_id = str(uuid.uuid4())
+            call_metadata = _metadata(self._options, metadata, request_id)
+
+            def invoke() -> Any:
+                try:
+                    with _span(self._options.tracer, rpc_name):
+                        with rpc_timer(self._options.logger, rpc_name, request_id):
+                            return attr(
+                                request,
+                                timeout=self._options.timeout if timeout is None else timeout,
+                                metadata=call_metadata,
+                                **kwargs,
+                            )
+                except grpc.RpcError as err:
+                    raise wrap_error(err) from err
+
+            if self._options.retry and should_retry_rpc(name):
+                return retry_sync(self._options.retry, invoke)
+            return invoke()
+
+        return call
+
+
+class _AsyncServiceProxy:
+    def __init__(self, target: Any, options: ClientOptions) -> None:
+        self._target = target
+        self._options = options
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._target, name)
+        if not callable(attr):
+            return attr
+
+        async def call(request: Any, *, timeout: float | None = None, metadata: Metadata = None, **kwargs: Any) -> Any:
+            rpc = getattr(attr, "_method", name)
+            rpc_name = rpc.decode() if isinstance(rpc, bytes) else str(rpc)
+            request_id = str(uuid.uuid4())
+            call_metadata = _metadata(self._options, metadata, request_id)
+
+            async def invoke() -> Any:
+                try:
+                    with _span(self._options.tracer, rpc_name):
+                        with rpc_timer(self._options.logger, rpc_name, request_id):
+                            result = attr(
+                                request,
+                                timeout=self._options.timeout if timeout is None else timeout,
+                                metadata=call_metadata,
+                                **kwargs,
+                            )
+                            if inspect.isawaitable(result):
+                                return await result
+                            return result
+                except grpc.RpcError as err:
+                    raise wrap_error(err) from err
+
+            if self._options.retry and should_retry_rpc(name):
+                return await retry_async(self._options.retry, invoke)
+            return await invoke()
+
+        return call
+
+
+def _metadata(options: ClientOptions, metadata: Metadata, request_id: str) -> list[tuple[str, str]]:
+    out = list(metadata or [])
+    if options.token:
+        out.append(("authorization", f"Bearer {options.token}"))
+    out.append(("x-request-id", request_id))
+    return inject_traceparent(out)
+
+
+class _NoopSpan:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+
+def _span(tracer: Any, rpc_name: str) -> Any:
+    if tracer is None:
+        return _NoopSpan()
+    start = getattr(tracer, "start_as_current_span", None)
+    if not callable(start):
+        return _NoopSpan()
+    return start(f"kave.{rpc_name.rsplit('/', 1)[-1]}")
+
+
+class SyncClient(highlevel.SyncHighLevelMixin, iterators.SyncIteratorMixin):
     def __init__(
         self,
-        addr: str = "localhost:8080",
+        addr: str | None = None,
         *,
         token: str | None = None,
         tls: bool = False,
         credentials: grpc.ChannelCredentials | None = None,
+        timeout: float = 30.0,
+        retry: RetryPolicy | None = DEFAULT_RETRY_POLICY,
+        logger: logging.Logger | None = None,
+        tracer: Any | None = None,
+        options: ClientOptions | None = None,
     ) -> None:
-        self._addr = addr
-        self._token = token
-        self._tls = tls
-        self._creds = credentials
-        self._channel: grpc.aio.Channel | None = None
+        self.options = options or ClientOptions(
+            addr=addr or "localhost:19090",
+            token=token,
+            tls=tls,
+            credentials=credentials,
+            timeout=timeout,
+            retry=retry,
+            logger=logger,
+            tracer=tracer,
+        )
+        self._channel = self._make_channel()
+        self.control = _SyncServiceProxy(control_pb2_grpc.ControlPlaneServiceStub(self._channel), self.options)
+        self.rbac = _SyncServiceProxy(rbac_pb2_grpc.RBACServiceStub(self._channel), self.options)
+        self.runtime = _SyncServiceProxy(runtime_pb2_grpc.RuntimeServiceStub(self._channel), self.options)
+        self.audit = _SyncServiceProxy(audit_pb2_grpc.AuditServiceStub(self._channel), self.options)
+
+    def _make_channel(self) -> grpc.Channel:
+        if self.options.credentials is not None:
+            return grpc.secure_channel(self.options.addr, self.options.credentials)
+        if self.options.tls:
+            return grpc.secure_channel(self.options.addr, grpc.ssl_channel_credentials())
+        return grpc.insecure_channel(self.options.addr)
+
+    def __enter__(self) -> SyncClient:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._channel.close()
+
+
+class AsyncClient(highlevel.AsyncHighLevelMixin, iterators.AsyncIteratorMixin):
+    def __init__(
+        self,
+        addr: str | None = None,
+        *,
+        token: str | None = None,
+        tls: bool = False,
+        credentials: grpc.ChannelCredentials | None = None,
+        timeout: float = 30.0,
+        retry: RetryPolicy | None = DEFAULT_RETRY_POLICY,
+        logger: logging.Logger | None = None,
+        tracer: Any | None = None,
+        options: ClientOptions | None = None,
+    ) -> None:
+        self.options = options or ClientOptions(
+            addr=addr or "localhost:19090",
+            token=token,
+            tls=tls,
+            credentials=credentials,
+            timeout=timeout,
+            retry=retry,
+            logger=logger,
+            tracer=tracer,
+        )
+        self._channel = self._make_channel()
+        self.control = _AsyncServiceProxy(control_pb2_grpc.ControlPlaneServiceStub(self._channel), self.options)
+        self.rbac = _AsyncServiceProxy(rbac_pb2_grpc.RBACServiceStub(self._channel), self.options)
+        self.runtime = _AsyncServiceProxy(runtime_pb2_grpc.RuntimeServiceStub(self._channel), self.options)
+        self.audit = _AsyncServiceProxy(audit_pb2_grpc.AuditServiceStub(self._channel), self.options)
 
     def _make_channel(self) -> grpc.aio.Channel:
-        interceptors: list[grpc.aio.ClientInterceptor] = []
-        if self._token:
-            interceptors.append(_TokenInterceptor(self._token))
+        if self.options.credentials is not None:
+            return grpc.aio.secure_channel(self.options.addr, self.options.credentials)
+        if self.options.tls:
+            return grpc.aio.secure_channel(self.options.addr, grpc.ssl_channel_credentials())
+        return grpc.aio.insecure_channel(self.options.addr)
 
-        if self._creds is not None:
-            return grpc.aio.secure_channel(self._addr, self._creds, interceptors=interceptors)
-        if self._tls:
-            return grpc.aio.secure_channel(
-                self._addr, grpc.ssl_channel_credentials(), interceptors=interceptors
-            )
-        return grpc.aio.insecure_channel(self._addr, interceptors=interceptors)
-
-    async def __aenter__(self) -> KaveClient:
-        self._channel = self._make_channel()
-        self.control = control_pb2_grpc.ControlPlaneServiceStub(self._channel)
-        self.runtime = runtime_pb2_grpc.RuntimeServiceStub(self._channel)
-        self.audit = audit_pb2_grpc.AuditServiceStub(self._channel)
+    async def __aenter__(self) -> AsyncClient:
         return self
 
     async def __aexit__(self, *_: object) -> None:
-        if self._channel:
-            await self._channel.close()
-            self._channel = None
+        await self.close()
+
+    async def close(self) -> None:
+        await self._channel.close()
 
 
-class _TokenInterceptor(grpc.aio.UnaryUnaryClientInterceptor):
-    def __init__(self, token: str) -> None:
-        self._meta = [("authorization", f"Bearer {token}")]
-
-    async def intercept_unary_unary(  # type: ignore[override]
-        self, continuation, client_call_details, request
-    ):
-        if client_call_details.metadata is None:
-            client_call_details.metadata = []
-        client_call_details.metadata.extend(self._meta)
-        return await continuation(client_call_details, request)
+KaveClient = AsyncClient
+Client = SyncClient

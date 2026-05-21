@@ -1,16 +1,25 @@
 [project]
-name = "kave-py"
+name = "kave-sdk"
 version = "0.1.0"
-description = "Kave Python SDK — control plane for AI agents"
+description = "Kave Python SDK - control plane for AI agents"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "grpcio>=1.80.0",
+    "protobuf>=6.30.0",
 ]
 
 [project.optional-dependencies]
+django = [
+    "django>=4.2",
+    "djangorestframework>=3.14",
+]
+otel = [
+    "opentelemetry-api>=1.24",
+]
 dev = [
-    "grpcio-tools>=1.80.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
 ]
 
 [build-system]
@@ -22,5 +31,13 @@ packages = ["kave"]
 
 [tool.uv]
 dev-dependencies = [
-    "grpcio-tools>=1.80.0",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "contract: contract tests against the Kave fixture server",
+    "integration: integration tests that require a running Kave server",
 ]
