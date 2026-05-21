@@ -6,9 +6,5 @@ dist/
 wheels/
 *.egg-info
 
-# buf-generated gRPC stubs (regenerate with: make sdk-generate)
-kave/**/*_pb2*.py
-kave/**/*_pb2*.pyi
-
 # Virtual environments
 .venv
