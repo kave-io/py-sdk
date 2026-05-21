@@ -38,7 +38,8 @@ jobs:
         uses: sigstore/cosign-installer@v3
 
       - name: Enforce changelog entry
-        run: core/scripts/check-sdk-changelog.sh py "${GITHUB_REF_NAME#sdk/py/}"
+        working-directory: core
+        run: scripts/check-sdk-changelog.sh py "${GITHUB_REF_NAME#sdk/py/}"
 
       - name: Build sdist and wheel
         working-directory: sdk/py
