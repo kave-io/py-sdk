@@ -54,4 +54,8 @@ SDK calls wrap gRPC failures in `KaveError`. Use predicates such as
 Install `kave-sdk[django]`, add `kave.contrib.django` to `INSTALLED_APPS`, define
 `KAVE = {...}`, and run `python manage.py kave_reconcile` on deploy.
 
+For multi-tenant Django apps, use `kave.contrib.django.UserAgentManager` to
+map each app user to an isolated Kave agent and manage budget updates
+(`set_user_budget`, `top_up_user_budget`, `report_usage`).
+
 See `examples/` and `../CONTRACT.md` for the full parity contract.

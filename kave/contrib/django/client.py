@@ -59,3 +59,16 @@ def issue_agent_token(agent: str | None = None, name: str = "django-runtime") ->
     ctx = resolve_runtime_context(agent)
     resp = get_client().create_agent_token(control_pb2.CreateTokenRequest(agent_id=ctx.agent_id, name=name))
     return resp.raw_token
+
+
+def issue_user_agent_token(user_key: str, *, name_prefix: str = "django-user-runtime") -> str:
+    from kave.contrib.django.tenant import UserAgentManager
+
+    user_ctx = UserAgentManager(client=get_client()).ensure_user_agent(str(user_key))
+    resp = get_client().create_agent_token(
+        control_pb2.CreateTokenRequest(
+            agent_id=user_ctx.runtime.agent_id,
+            name=f"{name_prefix}-{user_ctx.agent_name}",
+        )
+    )
+    return resp.raw_token
