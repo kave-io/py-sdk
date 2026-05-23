@@ -14,7 +14,7 @@ from kave.errors import (
 from kave.highlevel import WithSpan
 from kave.retry import DEFAULT_RETRY_POLICY, NO_RETRY, RetryPolicy
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "AsyncClient",

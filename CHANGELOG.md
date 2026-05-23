@@ -1,5 +1,11 @@
 # Python SDK Changelog
 
+## 0.2.0
+
+- Promoted the Python SDK release to `0.2.0`.
+- Kept the package name as `kave-sdk` with import package `kave`.
+- Continued shipping sync/async clients, retry helpers, pagination helpers, and Django integration.
+
 ## 0.1.0
 
 - Renamed the PyPI distribution to `kave-sdk` with import package `kave`.
